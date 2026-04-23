@@ -1,1 +1,527 @@
-# тут будет код
+#!/usr/bin/env python3
+"""
+PRO FINANCE BRAIN - ПОЛНАЯ ВЕРСИЯ
+БЕЗ ЖЁСТКИХ СПИСКОВ - всё через LLM
+Двухуровневый поиск, исторический тренд, географический контекст
+"""
+
+import os
+import re
+import json
+import time
+import hashlib
+import logging
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from typing import Dict, Any, Optional, Tuple
+
+import requests
+import yfinance as yf
+from ddgs import DDGS
+
+# ================= НАСТРОЙКИ =================
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+MODEL = "openai/gpt-oss-120b:free"
+
+CURRENT_DATE = datetime.now().strftime("%d.%m.%Y")
+
+CACHE_DIR = "cache"
+PRICE_CACHE_DIR = os.path.join(CACHE_DIR, "prices")
+NEWS_CACHE_DIR = os.path.join(CACHE_DIR, "news")
+GLOBAL_NEWS_CACHE_DIR = os.path.join(CACHE_DIR, "global_news")
+TREND_CACHE_DIR = os.path.join(CACHE_DIR, "trend")
+DETECTOR_CACHE_DIR = os.path.join(CACHE_DIR, "detector")
+
+for d in [CACHE_DIR, PRICE_CACHE_DIR, NEWS_CACHE_DIR, GLOBAL_NEWS_CACHE_DIR, TREND_CACHE_DIR, DETECTOR_CACHE_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+CACHE_TTL_PRICE = 60
+CACHE_TTL_TREND = 3600
+CACHE_TTL_GLOBAL_NEWS = 7200
+CACHE_TTL_NEWS = 600
+CACHE_TTL_DETECTOR = 86400
+
+MAX_TOKENS_ANALYSIS = 800
+MAX_TOKENS_DETECTOR = 150
+
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ================= КЭШ =================
+def get_cache_key(*parts) -> str:
+    return hashlib.md5("|".join(str(p) for p in parts).encode()).hexdigest()
+
+def get_cached(cache_dir: str, key: str, ttl: int) -> Optional[Any]:
+    cache_file = os.path.join(cache_dir, f"{key}.json")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                data = json.load(f)
+                if time.time() - data.get("timestamp", 0) < ttl:
+                    return data.get("value")
+        except:
+            pass
+    return None
+
+def set_cached(cache_dir: str, key: str, value: Any):
+    cache_file = os.path.join(cache_dir, f"{key}.json")
+    try:
+        with open(cache_file, "w") as f:
+            json.dump({"timestamp": time.time(), "value": value}, f)
+    except:
+        pass
+
+# ================= LLM =================
+def call_llm(prompt: str, max_tokens: int, temperature: float = 0.3) -> str:
+    if not OPENROUTER_API_KEY:
+        return "ERROR: No API key"
+    
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": temperature
+            },
+            timeout=25
+        )
+        if resp.status_code == 200:
+            content = resp.json()["choices"][0]["message"]["content"]
+            content = re.sub(r'\*\*?|__|#{1,6}\s|`{1,3}|\|', '', content)
+            return content.strip()
+        else:
+            return f"ERROR: HTTP {resp.status_code}"
+    except Exception as e:
+        return f"ERROR: {str(e)[:100]}"
+
+# ================= API ДЛЯ ЦЕН =================
+def get_usd_rub() -> Optional[float]:
+    try:
+        resp = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=8)
+        if resp.status_code == 200:
+            rate = resp.json()["Valute"]["USD"]["Value"]
+            if rate and 50 < rate < 200:
+                return rate
+    except:
+        pass
+    
+    try:
+        resp = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=8)
+        if resp.status_code == 200:
+            rate = resp.json()["rates"]["RUB"]
+            if rate and 50 < rate < 200:
+                return rate
+    except:
+        pass
+    return None
+
+def get_eur_rub() -> Optional[float]:
+    try:
+        resp = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=8)
+        if resp.status_code == 200:
+            return resp.json()["Valute"]["EUR"]["Value"]
+    except:
+        pass
+    return None
+
+def get_cny_rub() -> Optional[float]:
+    cache_key = get_cache_key("cny_rub")
+    cached = get_cached(PRICE_CACHE_DIR, cache_key, CACHE_TTL_PRICE)
+    if cached:
+        return cached
+    try:
+        resp = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            for code in ["CNY", "CNYK"]:
+                if code in data["Valute"]:
+                    rate = data["Valute"][code]["Value"]
+                    set_cached(PRICE_CACHE_DIR, cache_key, rate)
+                    return rate
+    except:
+        pass
+    return None
+
+def get_any_currency_rate(from_currency: str) -> Optional[float]:
+    cache_key = get_cache_key("currency", from_currency)
+    cached = get_cached(PRICE_CACHE_DIR, cache_key, CACHE_TTL_PRICE)
+    if cached:
+        return cached
+    try:
+        resp = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "USD" in data["Valute"]:
+                usd_rate = data["Valute"]["USD"]["Value"]
+                approx = {"GBP": 1.25, "CHF": 1.10, "JPY": 0.0065}
+                if from_currency in approx:
+                    rate = usd_rate * approx[from_currency]
+                    set_cached(PRICE_CACHE_DIR, cache_key, rate)
+                    return rate
+    except:
+        pass
+    return None
+
+def get_moex_price(ticker: str) -> Optional[float]:
+    cache_key = get_cache_key("moex", ticker)
+    cached = get_cached(PRICE_CACHE_DIR, cache_key, CACHE_TTL_PRICE)
+    if cached:
+        return cached
+    try:
+        urls = [
+            f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/tqbr/securities/{ticker}.json",
+            f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}.json",
+        ]
+        for url in urls:
+            resp = requests.get(url, timeout=8)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            if "marketdata" in data and data["marketdata"]["data"]:
+                cols = data["marketdata"]["columns"]
+                if "LAST" in cols:
+                    idx = cols.index("LAST")
+                    for row in data["marketdata"]["data"]:
+                        if len(row) > idx and row[idx] is not None:
+                            price = float(row[idx])
+                            if price > 0:
+                                set_cached(PRICE_CACHE_DIR, cache_key, price)
+                                return price
+        return None
+    except:
+        return None
+
+def get_yahoo_price(ticker: str) -> Optional[float]:
+    cache_key = get_cache_key("yahoo", ticker)
+    cached = get_cached(PRICE_CACHE_DIR, cache_key, CACHE_TTL_PRICE)
+    if cached:
+        return cached
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        hist = ticker_obj.history(period="1d")
+        if not hist.empty:
+            price = float(hist["Close"].iloc[-1])
+            set_cached(PRICE_CACHE_DIR, cache_key, price)
+            return price
+    except:
+        pass
+    return None
+
+def get_price_trend(ticker: str, market: str, days: int = 30) -> Optional[Dict[str, Any]]:
+    if market not in ("yahoo", "crypto"):
+        return None
+    
+    cache_key = get_cache_key("trend", ticker, market, days)
+    cached = get_cached(TREND_CACHE_DIR, cache_key, CACHE_TTL_TREND)
+    if cached:
+        return cached
+    
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        hist = ticker_obj.history(period=f"{days}d")
+        if not hist.empty and len(hist) >= 5:
+            prices = hist["Close"].tolist()
+            trend = {
+                "current": round(prices[-1], 2),
+                "week_ago": round(prices[-7], 2) if len(prices) >= 7 else round(prices[0], 2),
+                "month_ago": round(prices[0], 2),
+                "high": round(max(prices), 2),
+                "low": round(min(prices), 2),
+                "change_percent": round(((prices[-1] - prices[0]) / prices[0]) * 100, 1)
+            }
+            set_cached(TREND_CACHE_DIR, cache_key, trend)
+            return trend
+    except:
+        pass
+    return None
+
+# ================= ДЕТЕКТОР (БЕЗ СПИСКОВ) =================
+def detect_intent(query: str) -> Dict[str, Any]:
+    cache_key = get_cache_key("intent", query.lower())
+    cached = get_cached(DETECTOR_CACHE_DIR, cache_key, CACHE_TTL_DETECTOR)
+    if cached:
+        return cached
+
+    prompt = f"""Ты классификатор финансовых запросов. Верни ТОЛЬКО JSON.
+
+Запрос: {query}
+
+JSON:
+{{"type": "financial" или "general", "ticker": "тикер или null", "market": "forex/crypto/moex/yahoo/null", "need_search": true/false}}
+
+Правила определения:
+- Вопросы про валюты (доллар, евро, юань, фунт, франк, йена) → market: "forex", ticker: USD/EUR/CNY/GBP/CHF/JPY
+- Вопросы про биткоин, эфир, крипту → market: "crypto", ticker: BTC-USD/ETH-USD
+- Вопросы про российские акции (сбер, газпром, лукойл) → market: "moex", ticker: SBER/GAZP/LKOH
+- Вопросы про иностранные акции (apple, tesla) → market: "yahoo", ticker: AAPL/TSLA
+- Если нужен анализ, прогноз, новости → need_search: true
+
+Только JSON, без пояснений."""
+
+    response = call_llm(prompt, MAX_TOKENS_DETECTOR, 0.1)
+    
+    try:
+        json_match = re.search(r'\{[^{}]*\}', response)
+        if json_match:
+            result = json.loads(json_match.group())
+            set_cached(DETECTOR_CACHE_DIR, cache_key, result)
+            return result
+    except:
+        pass
+    
+    return {"type": "general", "ticker": None, "market": None, "need_search": False}
+
+# ================= ДВУХУРОВНЕВЫЙ ПОИСК НОВОСТЕЙ (БЕЗ СПИСКОВ) =================
+def search_global_news(ticker: str) -> str:
+    """Поиск глобальных событий - LLM сама определит географию"""
+    cache_key = get_cache_key("global_news", ticker)
+    cached = get_cached(GLOBAL_NEWS_CACHE_DIR, cache_key, CACHE_TTL_GLOBAL_NEWS)
+    if cached:
+        return cached
+    
+    queries = [
+        f"{ticker} глобальные тренды",
+        f"{ticker} макроэкономика",
+        "мировые финансовые новости",
+        "геополитика влияние на рынки"
+    ]
+    info = []
+    
+    try:
+        with DDGS() as ddgs:
+            for q in queries:
+                try:
+                    results = list(ddgs.text(q, max_results=2))
+                    for r in results:
+                        title = r.get("title", "")
+                        if title and len(title) > 10:
+                            info.append(f"{title}")
+                except:
+                    continue
+    except:
+        pass
+    
+    info = list(dict.fromkeys(info))
+    result = "\n".join(info[:8]) if info else "Нет данных о глобальных событиях"
+    set_cached(GLOBAL_NEWS_CACHE_DIR, cache_key, result)
+    return result
+
+def search_recent_news(ticker: str, days: int = 7) -> str:
+    """Поиск свежих новостей"""
+    cache_key = get_cache_key("recent_news", ticker, days)
+    cached = get_cached(NEWS_CACHE_DIR, cache_key, CACHE_TTL_NEWS)
+    if cached:
+        return cached
+    
+    queries = [
+        f"{ticker} новости",
+        f"{ticker} сегодня",
+        f"{ticker} аналитика"
+    ]
+    all_news = []
+    
+    try:
+        with DDGS() as ddgs:
+            for q in queries:
+                try:
+                    results = list(ddgs.news(q, max_results=3, region='ru-ru'))
+                    for r in results:
+                        title = r.get("title", "")
+                        date = r.get("date", "")[:10] if r.get("date") else ""
+                        if date:
+                            try:
+                                news_date = datetime.strptime(date, "%Y-%m-%d")
+                                if news_date < datetime.now() - timedelta(days=days):
+                                    continue
+                            except:
+                                pass
+                        if title and len(title) > 10:
+                            all_news.append(f"[{date}] {title}")
+                except:
+                    continue
+    except Exception as e:
+        logger.error(f"News error: {e}")
+    
+    all_news = list(dict.fromkeys(all_news))
+    if all_news:
+        result = "\n".join(all_news[:6])
+    else:
+        result = "Не найдено свежих новостей за последние 7 дней"
+    set_cached(NEWS_CACHE_DIR, cache_key, result)
+    return result
+
+# ================= ПОЛУЧЕНИЕ ЦЕНЫ =================
+def get_price(ticker: str, market: str) -> Tuple[Optional[float], Optional[str]]:
+    if market == "forex":
+        if ticker == "USD":
+            return get_usd_rub(), "RUB"
+        elif ticker == "EUR":
+            return get_eur_rub(), "RUB"
+        elif ticker == "CNY":
+            return get_cny_rub(), "RUB"
+        elif ticker in ["GBP", "CHF", "JPY"]:
+            rate = get_any_currency_rate(ticker)
+            return rate, "RUB" if rate else None
+    elif market == "moex":
+        price = get_moex_price(ticker)
+        return price, "RUB" if price else None
+    elif market in ("yahoo", "crypto"):
+        price = get_yahoo_price(ticker)
+        return price, "USD" if price else None
+    return None, None
+
+# ================= СБОР КОНТЕКСТА =================
+def build_context(query: str) -> Dict[str, Any]:
+    intent = detect_intent(query)
+    
+    if intent.get("type") == "general":
+        return {"type": "general", "query": query}
+    
+    ticker = intent.get("ticker")
+    market = intent.get("market")
+    need_search = intent.get("need_search", True)
+    
+    results = {"price": None, "trend": None, "usd": None, "global_news": "", "recent_news": ""}
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            'price': executor.submit(get_price, ticker, market) if ticker and market else None,
+            'trend': executor.submit(get_price_trend, ticker, market, 30) if ticker and market in ("yahoo", "crypto") else None,
+            'usd': executor.submit(get_usd_rub),
+            'global_news': executor.submit(search_global_news, ticker) if need_search and ticker else None,
+            'recent_news': executor.submit(search_recent_news, ticker, 7) if need_search and ticker else None
+        }
+        
+        for key, future in futures.items():
+            if future is None:
+                continue
+            try:
+                results[key] = future.result(timeout=15)
+            except:
+                results[key] = None if key not in ('global_news', 'recent_news') else ""
+    
+    price_info = results.get('price')
+    price = price_info[0] if price_info and isinstance(price_info, tuple) else None
+    currency = price_info[1] if price_info and isinstance(price_info, tuple) else None
+    
+    return {
+        "type": "financial",
+        "ticker": ticker,
+        "market": market,
+        "price": price,
+        "currency": currency or "RUB",
+        "trend": results.get('trend'),
+        "usd_rate": results.get('usd'),
+        "global_news": results.get('global_news', ''),
+        "recent_news": results.get('recent_news', ''),
+        "need_search": need_search,
+        "current_date": CURRENT_DATE
+    }
+
+# ================= ГЕНЕРАЦИЯ АНАЛИЗА =================
+def generate_analysis(query: str, ctx: Dict[str, Any]) -> str:
+    if ctx["type"] == "general":
+        prompt = f"Ответь кратко: {ctx.get('query', query)}"
+        return call_llm(prompt, MAX_TOKENS_ANALYSIS, 0.5)
+    
+    price_str = f"{ctx['price']} {ctx['currency']}" if ctx['price'] else "не найдена"
+    
+    trend_info = ""
+    if ctx.get('trend'):
+        t = ctx['trend']
+        trend_info = f"""
+Тренд за 30 дней:
+- Текущая: {t['current']}
+- Неделю назад: {t['week_ago']}
+- Месяц назад: {t['month_ago']}
+- Изменение: {t['change_percent']}%
+- Диапазон: {t['low']} - {t['high']}"""
+    
+    prompt = f"""Ты финансовый аналитик. Сегодня {ctx['current_date']}.
+
+Актив: {ctx['ticker']}
+Текущая цена: {price_str}
+{trend_info}
+Курс USD/RUB: {ctx['usd_rate'] if ctx['usd_rate'] else 'не найден'}
+
+=== ГЛОБАЛЬНЫЕ СОБЫТИЯ ===
+{ctx['global_news'][:1000] if ctx['global_news'] else 'Нет данных'}
+
+=== СВЕЖИЕ НОВОСТИ ===
+{ctx['recent_news'][:600] if ctx['recent_news'] else 'Не найдено свежих новостей'}
+
+ВАЖНЫЕ ПРАВИЛА:
+1. Используй ТОЛЬКО факты из новостей выше.
+2. Не выдумывай цифры, которых нет в данных.
+3. Не пиши ссылки.
+4. Учитывай географию: анализируй, какие страны и регуляторы влияют на актив.
+5. Свежие новости могут отсутствовать — это нормально, просто укажи это.
+
+Напиши в формате:
+Ситуация: (текущая цена и тренд)
+Глобальный контекст: (ключевые события и их география)
+Факторы: (что влияет на цену сейчас)
+Прогноз: (краткий вывод)
+
+Максимум 250 слов."""
+
+    response = call_llm(prompt, MAX_TOKENS_ANALYSIS, 0.3)
+    return response
+
+# ================= ВЫВОД =================
+def format_output(ctx: Dict[str, Any], analysis: str) -> str:
+    if ctx["type"] == "general":
+        return f"\n{analysis}\n"
+    
+    price_str = f"{ctx['price']} {ctx['currency']}" if ctx['price'] else "не найдена"
+    
+    return f"""
+Актив: {ctx['ticker']}
+Цена: {price_str}
+USD/RUB: {ctx['usd_rate'] if ctx['usd_rate'] else 'не найден'}
+
+{analysis}
+---"""
+
+# ================= ОСНОВНОЙ ЦИКЛ =================
+def main():
+    print("\n" + "="*60)
+    print("PRO FINANCE BRAIN - ПОЛНАЯ ВЕРСИЯ")
+    print(f"Сегодня: {CURRENT_DATE}")
+    print("="*60)
+    print("/exit - выход")
+    print("="*60 + "\n")
+    
+    if not OPENROUTER_API_KEY:
+        print("ОШИБКА: Установите OPENROUTER_API_KEY\n")
+        return
+    
+    print("Бот готов.\n")
+    
+    while True:
+        try:
+            user_input = input("Вы: ").strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ("/exit", "/quit"):
+                print("\nДо свидания!")
+                break
+            
+            ctx = build_context(user_input)
+            analysis = generate_analysis(user_input, ctx)
+            print(format_output(ctx, analysis))
+            
+        except KeyboardInterrupt:
+            print("\nДо свидания!")
+            break
+        except Exception as e:
+            print(f"\nОшибка: {e}\n")
+
+if __name__ == "__main__":
+    main()
