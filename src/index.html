@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Финансовый AI-ассистент</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0d0d0d; color: #e0e0e0; display: flex; height: 100vh; }
+        .sidebar { width: 280px; background: #1a1a1a; border-right: 1px solid #2a2a2a; display: flex; flex-direction: column; padding: 15px; }
+        .sidebar h2 { color: #ffd700; margin-bottom: 10px; font-size: 1.3rem; }
+        .chat-list { flex: 1; overflow-y: auto; margin-bottom: 10px; }
+        .chat-item { padding: 10px; margin: 4px 0; background: #252525; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; font-size: 0.9rem; }
+        .chat-item.active { background: #3a3a3a; border: 1px solid #ffd700; }
+        .chat-item:hover { background: #333; }
+        .chat-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .chat-actions { display: flex; gap: 5px; margin-left: 8px; }
+        .chat-actions button { background: none; border: none; color: #aaa; cursor: pointer; font-size: 0.9rem; padding: 2px 4px; }
+        .chat-actions button:hover { color: #fff; }
+        .new-chat-btn { background: #ffd700; color: #000; border: none; padding: 10px; border-radius: 6px; cursor: pointer; font-weight: bold; margin-bottom: 10px; }
+        .clear-all-btn { background: #333; color: #ccc; border: none; padding: 8px; border-radius: 6px; cursor: pointer; }
+        .clear-all-btn:hover { background: #444; }
+        .chat-container { flex: 1; display: flex; flex-direction: column; max-width: 800px; margin: 0 auto; width: 100%; padding: 20px; }
+        .messages { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 15px; }
+        .message { display: flex; gap: 10px; align-items: flex-start; }
+        .message.user { justify-content: flex-end; }
+        .message.bot { justify-content: flex-start; }
+        .avatar { width: 36px; height: 36px; border-radius: 50%; background: #2a2a2a; display: flex; align-items: center; justify-content: center; font-size: 1.2rem; flex-shrink: 0; }
+        .user .avatar { background: #ffd700; color: #000; }
+        .bot .avatar { background: #4a4aff; color: #fff; }
+        .msg-content { max-width: 70%; padding: 12px 16px; border-radius: 18px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+        .user .msg-content { background: #2b5278; color: #fff; border-bottom-right-radius: 4px; }
+        .bot .msg-content { background: #1e1e1e; border: 1px solid #333; color: #e0e0e0; border-bottom-left-radius: 4px; }
+        .status-msg { color: #aaa; font-style: italic; padding: 10px; display: flex; align-items: center; gap: 10px; }
+        .spinner { width: 20px; height: 20px; border: 2px solid #333; border-top-color: #ffd700; border-radius: 50%; animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .input-area { display: flex; gap: 10px; padding: 15px 0; border-top: 1px solid #2a2a2a; }
+        .input-area input { flex: 1; padding: 12px 16px; border-radius: 25px; border: 1px solid #333; background: #1a1a1a; color: #e0e0e0; outline: none; font-size: 1rem; }
+        .input-area input:focus { border-color: #ffd700; }
+        .input-area input:disabled { opacity: 0.5; background: #222; }
+        .input-area button { background: #ffd700; border: none; color: #000; font-weight: bold; padding: 0 25px; border-radius: 25px; cursor: pointer; }
+        .input-area button:disabled { background: #555; color: #999; cursor: not-allowed; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #1a1a1a; }
+        ::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <h2>💰 FinBot</h2>
+        <button class="new-chat-btn" onclick="createNewChat()">+ Новый чат</button>
+        <div class="chat-list" id="chatList"></div>
+        <button class="clear-all-btn" onclick="deleteAllChats()">🗑 Удалить все чаты</button>
+    </div>
+    <div class="chat-container">
+        <div class="messages" id="messages"></div>
+        <div class="input-area">
+            <input type="text" id="userInput" placeholder="Введите запрос..." onkeydown="if(event.key==='Enter' && !isProcessing) sendMessage()">
+            <button id="sendBtn" onclick="sendMessage()">➤</button>
+        </div>
+    </div>
+
+    <script type="text/javascript" src="/eel.js"></script>
+    <script>
+        // Функция для получения обновлений статуса из Python
+        eel.expose(updateStatus, 'updateStatus');
+        function updateStatus(message) {
+            const statusSpan = document.querySelector('#statusMsg .status-text');
+            if (statusSpan) {
+                statusSpan.textContent = message;
+            }
+        }
+
+        const STORAGE_KEY = 'finbot_chats';
+        const messagesDiv = document.getElementById('messages');
+        const chatListDiv = document.getElementById('chatList');
+        const inputEl = document.getElementById('userInput');
+        const sendBtn = document.getElementById('sendBtn');
+
+        let chats = {};
+        let activeChatId = null;
+        let isProcessing = false;      // блокировка отправки
+
+        function setUiEnabled(enabled) {
+            inputEl.disabled = !enabled;
+            sendBtn.disabled = !enabled;
+            isProcessing = !enabled;
+        }
+
+        function loadChats() {
+            try {
+                const saved = localStorage.getItem(STORAGE_KEY);
+                if (saved) {
+                    chats = JSON.parse(saved);
+                } else {
+                    const defaultId = 'default';
+                    chats = { [defaultId]: { name: 'Основной чат', messages: [] } };
+                }
+                if (Object.keys(chats).length === 0) {
+                    const defaultId = 'default';
+                    chats[defaultId] = { name: 'Основной чат', messages: [] };
+                }
+            } catch (e) {
+                chats = { 'default': { name: 'Основной чат', messages: [] } };
+            }
+        }
+
+        function saveChats() {
+            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(chats)); } catch (e) {}
+        }
+
+        function generateChatId() {
+            return 'chat_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+        }
+
+        function createNewChat() {
+            const name = prompt('Название чата:', 'Новый чат');
+            if (!name) return;
+            const id = generateChatId();
+            chats[id] = { name: name.trim(), messages: [] };
+            saveChats();
+            renderChatList();
+            switchToChat(id);
+        }
+
+        function deleteChat(id) {
+            if (!confirm(`Удалить чат "${chats[id].name}"?`)) return;
+            delete chats[id];
+            saveChats();
+            if (activeChatId === id) {
+                const ids = Object.keys(chats);
+                activeChatId = ids.length > 0 ? ids[0] : null;
+            }
+            renderChatList();
+            if (activeChatId) renderMessages(activeChatId);
+            else messagesDiv.innerHTML = '<div class="empty"><p>Нет активного чата</p></div>';
+        }
+
+        function renameChat(id) {
+            const newName = prompt('Новое название:', chats[id].name);
+            if (newName && newName.trim()) {
+                chats[id].name = newName.trim();
+                saveChats();
+                renderChatList();
+            }
+        }
+
+        function switchToChat(id) {
+            activeChatId = id;
+            renderChatList();
+            renderMessages(id);
+            inputEl.focus();
+        }
+
+        function deleteAllChats() {
+            if (!confirm('Удалить ВСЕ чаты? Это действие необратимо.')) return;
+            chats = {};
+            const defaultId = 'default';
+            chats[defaultId] = { name: 'Основной чат', messages: [] };
+            saveChats();
+            activeChatId = defaultId;
+            renderChatList();
+            renderMessages(defaultId);
+        }
+
+        function renderChatList() {
+            chatListDiv.innerHTML = Object.entries(chats).map(([id, chat]) => {
+                const activeClass = id === activeChatId ? 'active' : '';
+                return `
+                    <div class="chat-item ${activeClass}" data-chat-id="${id}">
+                        <span class="chat-title" onclick="switchToChat('${id}')">${escapeHtml(chat.name)}</span>
+                        <div class="chat-actions">
+                            <button onclick="event.stopPropagation(); renameChat('${id}')" title="Переименовать">✏️</button>
+                            <button onclick="event.stopPropagation(); deleteChat('${id}')" title="Удалить">🗑</button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function renderMessages(chatId) {
+            if (!chatId || !chats[chatId]) { messagesDiv.innerHTML = ''; return; }
+            const msgs = chats[chatId].messages;
+            messagesDiv.innerHTML = msgs.map(msg => {
+                const avatar = msg.type === 'user' ? '👤' : '🤖';
+                return `
+                    <div class="message ${msg.type}">
+                        <div class="avatar">${avatar}</div>
+                        <div class="msg-content">${escapeHtml(msg.text)}</div>
+                    </div>
+                `;
+            }).join('');
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function showSpinner() {
+            const statusDiv = document.createElement('div');
+            statusDiv.className = 'status-msg';
+            statusDiv.id = 'statusMsg';
+            statusDiv.innerHTML = '<div class="spinner"></div> <span class="status-text">Ищу информацию...</span>';
+            messagesDiv.appendChild(statusDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function removeSpinner() {
+            const el = document.getElementById('statusMsg');
+            if (el) el.remove();
+        }
+
+        function typeWriter(text, element, speed = 15) {
+            let i = 0;
+            element.textContent = '';
+            function type() {
+                if (i < text.length) {
+                    element.textContent += text.charAt(i);
+                    i++;
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    setTimeout(type, speed);
+                }
+            }
+            type();
+        }
+
+        async function sendMessage() {
+            if (isProcessing) return;
+            const query = inputEl.value.trim();
+            if (!query || !activeChatId) return;
+            inputEl.value = '';
+
+            // Блокируем интерфейс
+            setUiEnabled(false);
+
+            chats[activeChatId].messages.push({ type: 'user', text: query });
+            saveChats();
+            renderMessages(activeChatId);
+
+            showSpinner();
+
+            try {
+                const reply = await eel.process_query(query)();
+                removeSpinner();
+
+                const msgDiv = document.createElement('div');
+                msgDiv.className = 'message bot';
+                msgDiv.innerHTML = '<div class="avatar">🤖</div><div class="msg-content"></div>';
+                const contentDiv = msgDiv.querySelector('.msg-content');
+                messagesDiv.appendChild(msgDiv);
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+                typeWriter(reply, contentDiv, 15);
+
+                setTimeout(() => {
+                    chats[activeChatId].messages.push({ type: 'bot', text: reply });
+                    saveChats();
+                }, reply.length * 15 + 100);
+            } catch (err) {
+                removeSpinner();
+                const errMsg = `Ошибка соединения: ${err.message}`;
+                const msgDiv = document.createElement('div');
+                msgDiv.className = 'message bot';
+                msgDiv.innerHTML = `<div class="avatar">🤖</div><div class="msg-content">${escapeHtml(errMsg)}</div>`;
+                messagesDiv.appendChild(msgDiv);
+                chats[activeChatId].messages.push({ type: 'bot', text: errMsg });
+                saveChats();
+            } finally {
+                setUiEnabled(true);
+                inputEl.focus();
+            }
+        }
+
+        loadChats();
+        if (!activeChatId) {
+            const ids = Object.keys(chats);
+            activeChatId = ids.length > 0 ? ids[0] : null;
+        }
+        renderChatList();
+        renderMessages(activeChatId);
+    </script>
+</body>
+</html>
